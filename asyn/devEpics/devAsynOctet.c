@@ -117,11 +117,12 @@ typedef struct devPvt {
     CALLBACK            processCallback;
     CALLBACK            outputCallback;
     int                 newOutputCallbackValue;
-    int                 numDeferredOutputCallbacks;
+    int                 outputCallbackRequested;
     int                 asyncProcessingActive;
     IOSCANPVT           ioScanPvt;
     void                *registrarPvt;
     int                 gotValue;
+    int                 scanIoRequested;
     interruptCallbackOctet interruptCallback;
     asynStatus          previousQueueRequestStatus;
 } devPvt;
@@ -449,8 +450,79 @@ static long getIoIntInfo(int cmd, dbCommon *pr, IOSCANPVT *iopvt)
                    pr->name, driverName, functionName, pPvt->pasynUser->errorMessage);
         }
     }
+    epicsMutexLock(pPvt->devPvtLock);
+    /* The record is entering or leaving I/O Intr scanning, so no scanIoRequest()
+     * of ours is outstanding.  Clear the flag: if it were left set from an
+     * earlier I/O Intr period, requestRecordProcessing() would never request
+     * processing again and buffered values would stop being consumed. */
+    pPvt->scanIoRequested = 0;
+    epicsMutexUnlock(pPvt->devPvtLock);
     *iopvt = pPvt->ioScanPvt;
     return 0;
+}
+
+static void requestRecordProcessing(devPvt *pPvt);
+static void requestOutputCallback(devPvt *pPvt);
+
+/* Are there readback values still waiting to be consumed by the record?
+ * Must be called with pPvt->devPvtLock held. */
+static int haveBufferedValue(devPvt *pPvt)
+{
+    return (pPvt->ringSize == 0) ? (pPvt->gotValue != 0)
+                                 : (pPvt->ringTail != pPvt->ringHead);
+}
+
+/* Request that an output record process to consume its readback value(s).
+ * Must be called with pPvt->devPvtLock held.
+ *
+ * As for requestRecordProcessing(), at most one request is outstanding per
+ * record, so a record occupies at most one entry of the EPICS general purpose
+ * callback queue however many readback values are buffered.
+ * outputCallbackCallback() clears the flag once the queue entry has been taken
+ * off the queue, and the end of record processing requests the next one while
+ * values remain.
+ *
+ * A request must not be posted while the record is in the middle of asynchronous
+ * processing, because dbProcess() would then find PACT=1 and refuse to process
+ * the record.  Nothing is posted in that case: the processing pass that is in
+ * flight posts it when it finishes.  This replaces the former counter of
+ * deferred callbacks, which counted callbacks rather than buffered values and so
+ * over-counted when the ring buffer overflowed. */
+static void requestOutputCallback(devPvt *pPvt)
+{
+    if (pPvt->outputCallbackRequested) return;
+    if (pPvt->asyncProcessingActive) return;
+#if LT_EPICSBASE(3,15,0,0)
+    callbackRequest(&pPvt->outputCallback);
+    pPvt->outputCallbackRequested = 1;
+#else
+    if (callbackRequest(&pPvt->outputCallback) == 0) pPvt->outputCallbackRequested = 1;
+#endif
+}
+
+/* Request that the record process so that it consumes the buffered value(s).
+ * Must be called with pPvt->devPvtLock held.
+ *
+ * At most one request is outstanding per record at any time: processCommon()
+ * and getRingBufferValue() issue the next request as they consume each value.
+ * The EPICS general purpose callback queue therefore needs only one entry per
+ * record, rather than one entry per buffered value.
+ *
+ * From EPICS 3.15 on, scanIoRequest() returns a mask of the scan priorities
+ * it queued the request for; 0 means nothing was queued, e.g. because the
+ * record is not (yet) I/O Intr scanned, scanning has not been started, or the
+ * callback queue is full.  Leave scanIoRequested clear in that case, so the
+ * next callback retries rather than waiting forever for a request that was
+ * never queued. */
+static void requestRecordProcessing(devPvt *pPvt)
+{
+    if (pPvt->scanIoRequested) return;
+#if LT_EPICSBASE(3,15,0,0)
+    scanIoRequest(pPvt->ioScanPvt);
+    pPvt->scanIoRequested = 1;
+#else
+    if (scanIoRequest(pPvt->ioScanPvt) != 0) pPvt->scanIoRequested = 1;
+#endif
 }
 
 static int getRingBufferValue(devPvt *pPvt)
@@ -469,6 +541,18 @@ static int getRingBufferValue(devPvt *pPvt)
         pPvt->result = pPvt->ringBuffer[pPvt->ringTail];
         pPvt->ringTail = (pPvt->ringTail==pPvt->ringSize) ? 0 : pPvt->ringTail+1;
         ret = 1;
+    }
+    if (pPvt->scanIoRequested) {
+        /* We are processing because of a scanIoRequest() from interruptCallback(),
+         * and the callback queue entry for it has already been taken off the
+         * queue.  Request the next processing here if there are more values to
+         * drain, so that only one queue entry per record is ever needed.  Doing
+         * this while still holding devPvtLock is what makes it safe:
+         * interruptCallback() either sees the flag still set and relies on us to
+         * re-request, or sees it cleared and requests itself, so a value can
+         * never be left in the ring buffer with no request outstanding. */
+        pPvt->scanIoRequested = 0;
+        if (pPvt->ringTail != pPvt->ringHead) requestRecordProcessing(pPvt);
     }
     epicsMutexUnlock(pPvt->devPvtLock);
     return ret;
@@ -509,15 +593,16 @@ static void interruptCallback(void *drvPvt, asynUser *pasynUser,
         pPvt->result.alarmStatus = pasynUser->alarmStatus;
         pPvt->result.alarmSeverity = pasynUser->alarmSeverity;
         if (pPvt->isOutput) {
-            /* If this callback was received during asynchronous record processing
-             * we must defer calling callbackRequest until end of record processing */
-            if (pPvt->asyncProcessingActive) {
-                pPvt->numDeferredOutputCallbacks++;
-            } else {
-                callbackRequest(&pPvt->outputCallback);
-            }
+            /* Ask the record to process.  A no-op if a request is already
+             * outstanding; the end of record processing requests the next one
+             * while values remain.  See requestOutputCallback(). */
+            requestOutputCallback(pPvt);
         } else {
-            scanIoRequest(pPvt->ioScanPvt);
+            /* Ask the record to process; a no-op if a request is already
+             * outstanding.  processCommon() requests the next processing while
+             * gotValue shows that callbacks remain unprocessed, so only one
+             * callback queue entry per record is needed. */
+            requestRecordProcessing(pPvt);
         }
     } else {
         /* Using a ring buffer */
@@ -545,20 +630,23 @@ static void interruptCallback(void *drvPvt, asynUser *pasynUser,
              * is guaranteed to be the most recent value */
             pPvt->ringTail = (pPvt->ringTail==pPvt->ringSize) ? 0 : pPvt->ringTail+1;
             pPvt->ringBufferOverflows++;
+        }
+        if (pPvt->isOutput) {
+            /* Ask the record to process.  A no-op if a request is already
+             * outstanding, so a burst of readback callbacks needs only a single
+             * callback queue entry; the end of record processing requests the next
+             * one while values remain.  This must also be called when we just
+             * replaced an element, so that a request which previously could not be
+             * posted is retried.  See requestOutputCallback(). */
+            requestOutputCallback(pPvt);
         } else {
-            /* We only need to request the record to process if we added a new
-             * element to the ring buffer, not if we just replaced an element. */
-            if (pPvt->isOutput) {
-                /* If this callback was received during asynchronous record processing
-                 * we must defer calling callbackRequest until end of record processing */
-                if (pPvt->asyncProcessingActive) {
-                    pPvt->numDeferredOutputCallbacks++;
-                } else {
-                    callbackRequest(&pPvt->outputCallback);
-                }
-            } else {
-                scanIoRequest(pPvt->ioScanPvt);
-            }
+            /* Ask the record to process; a no-op if a request is already
+             * outstanding.  getRingBufferValue() requests the next processing as
+             * it drains the ring buffer, so only one callback queue entry per
+             * record is needed.  This must also be called when we just replaced
+             * an element, so that a request which previously could not be queued
+             * is retried. */
+            requestRecordProcessing(pPvt);
         }
     }
     epicsMutexUnlock(pPvt->devPvtLock);
@@ -574,6 +662,8 @@ static void outputCallbackCallback(CALLBACK *pcb)
         dbCommon *pr = pPvt->precord;
         dbScanLock(pr);
         epicsMutexLock(pPvt->devPvtLock);
+        /* The callback queue entry that got us here has been taken off the queue. */
+        pPvt->outputCallbackRequested = 0;
         pPvt->newOutputCallbackValue = 1;
         /* We need to set udf=0 here so that it is already cleared when dbProcess is called */
         pr->udf = 0;
@@ -773,6 +863,14 @@ static long processCommon(dbCommon *precord)
         if (pPvt->ringSize == 0) {
             /* Data has already been copied to the record in interruptCallback */
             pPvt->gotValue--;
+            if (pPvt->scanIoRequested) {
+                /* The callback queue entry that got us here has been consumed;
+                 * request again while unprocessed callbacks remain, so that only
+                 * one queue entry per record is needed.  See
+                 * requestRecordProcessing(). */
+                pPvt->scanIoRequested = 0;
+                if (pPvt->gotValue) requestRecordProcessing(pPvt);
+            }
             if ((pPvt->pLen != NULL) && (pPvt->result.status == asynSuccess)) {
                 (*pPvt->pLen) = (pPvt->isWaveform ? pPvt->nord : pPvt->nord + 1); /* lsi, lso and printf count \0 in length */
             }
@@ -807,12 +905,13 @@ static long processCommon(dbCommon *precord)
                                             pPvt->isOutput ? WRITE_ALARM : READ_ALARM, &pPvt->result.alarmStatus,
                                             INVALID_ALARM, &pPvt->result.alarmSeverity);
     (void)recGblSetSevr(precord, pPvt->result.alarmStatus, pPvt->result.alarmSeverity);
-    if (pPvt->numDeferredOutputCallbacks > 0) {
-        callbackRequest(&pPvt->outputCallback);
-        pPvt->numDeferredOutputCallbacks--;
-    }
     pPvt->newOutputCallbackValue = 0;
     pPvt->asyncProcessingActive = 0;
+    /* Request the next processing if readback values remain to be consumed.
+     * asyncProcessingActive must be cleared first, otherwise
+     * requestOutputCallback() would defer the request to a processing pass that
+     * has just finished. */
+    if (pPvt->isOutput && haveBufferedValue(pPvt)) requestOutputCallback(pPvt);
     epicsMutexUnlock(pPvt->devPvtLock);
     if (pPvt->result.status == asynSuccess) {
         pPvt->precord->udf = 0;
