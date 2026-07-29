@@ -1,29 +1,20 @@
 dbLoadDatabase("../../dbd/testQueueOverflow.dbd")
 testQueueOverflow_registerRecordDeviceDriver(pdbbase)
 
-# --- The callback queue needs only one entry per I/O Intr record -----------
+# --- Same test as st.cmd, but with a ring buffer depth of 100 --------------
 #
-# devAsynInt32 keeps at most one outstanding process request per record: an
-# interrupt callback issues scanIoRequest() only if no request is pending, and
-# getCallbackValue() issues the next one as it pops each value while the ring
-# buffer is still not empty. The number of entries a record can occupy on the
-# shared "cbLow"/"cbMedium"/"cbHigh" general purpose callback queue is
-# therefore 1, independent of the ring buffer depth and of how fast data
-# arrives. (Before that change every buffered value posted its own entry, so
-# the queue had to be sized for NCHAN * ring depth.)
+# See st.cmd for the explanation. The point of this variant is that the
+# callback queue high-water mark does not depend on the ring buffer depth:
+# with FIFO=100 instead of 10, ten times as many values can sit unprocessed
+# in each record's ring buffer, yet cbLow still peaks at NCHAN (8) entries --
+# one per record -- and never overflows, with the same 32-entry queue.
 #
-# NCHAN=8 records here, so cbLow needs 8 entries. The queue is deliberately
-# left far below the old requirement of NCHAN * 10 = 80 to show that a small
-# queue is now sufficient: run the bursts below and look at the HIGH-WATER
-# MARK and Q OVERFLOWS columns printed by callbackQueueShow(0), EPICS Base's
-# iocsh command for inspecting the callback queues.
-#
-# Compare with st.cmd.deep_fifo, which runs the same burst with a ring buffer
-# depth of 100 and reaches the same high-water mark.
+# Under the old mechanism this configuration would have needed
+# NCHAN * 100 = 800 queue entries.
 
 epicsEnvSet("NCHAN","8")
 epicsEnvSet("QSIZE","32")
-epicsEnvSet("FIFO","10")
+epicsEnvSet("FIFO","100")
 
 # callbackSetQueueSize() only has an effect if called before iocInit()
 callbackSetQueueSize($(QSIZE))
