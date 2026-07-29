@@ -45,6 +45,18 @@
 #define INIT_DO_NOT_CONVERT 2
 #define INIT_ERROR -1
 
+/* scanOnceCallback(), which reports back after the requested dbProcess(), was
+ * added in EPICS Base 3.16.0.1.  It is what makes it possible to bound the number
+ * of scanOnce queue entries an output record uses: the completion callback is
+ * invoked whether or not dbProcess() actually processed the record, so a request
+ * that dbProcess() declined can never leave the record with no request
+ * outstanding.  Without it there is no safe point to clear such a flag, so on
+ * older versions of Base the previous behaviour is kept, i.e. one scanOnce()
+ * request per readback value. */
+#if !LT_EPICSBASE(3,16,0,1)
+  #define ASYN_HAVE_SCAN_ONCE_CALLBACK
+#endif
+
 static const char *driverName = "devAsynXXXArray";
 
 
@@ -81,6 +93,11 @@ private:
     int                 ringTail_;
     int                 ringSize_;
     int                 ringBufferOverflows_;
+    bool                scanIoRequested_;
+#ifdef ASYN_HAVE_SCAN_ONCE_CALLBACK
+    bool                scanOnceRequested_;
+    bool                scanOnceProcessed_;
+#endif
     ringBufferElement   result_;
     int                 gotValue_; /* For interruptCallbackInput */
     INTERRUPT           interruptCallback_;
@@ -105,6 +122,11 @@ public:
         ringTail_(0),
         ringSize_(0),
         ringBufferOverflows_(0),
+        scanIoRequested_(false),
+#ifdef ASYN_HAVE_SCAN_ONCE_CALLBACK
+        scanOnceRequested_(false),
+        scanOnceProcessed_(false),
+#endif
         gotValue_(0),
         interruptCallback_(interruptCallback),
         interfaceType_(epicsStrDup(interfaceType)),
@@ -259,6 +281,14 @@ public:
                           pRecord_->name, driverName, functionName, pasynUser_->errorMessage);
             }
         }
+        epicsMutexLock(ringBufferLock_);
+        /* The record is entering or leaving I/O Intr scanning, so no
+         * scanIoRequest() of ours is outstanding.  Clear the flag: if it were
+         * left set from an earlier I/O Intr period, requestRecordProcessing()
+         * would never request processing again and the ring buffer would stop
+         * being drained. */
+        scanIoRequested_ = false;
+        epicsMutexUnlock(ringBufferLock_);
         *iopvt = ioScanPvt_;
         return INIT_OK;
     }
@@ -325,6 +355,13 @@ public:
                         pRecord_->name, driverName, driverName, pRecord_->nord);
                 }
                 pRecord_->time = rp->time;
+#ifdef ASYN_HAVE_SCAN_ONCE_CALLBACK
+                /* Tell onceComplete() that the record processed, so that it may
+                 * request the next processing if more values are buffered. */
+                epicsMutexLock(ringBufferLock_);
+                scanOnceProcessed_ = true;
+                epicsMutexUnlock(ringBufferLock_);
+#endif
             }
         }
         pasynEpicsUtils->asynStatusToEpicsAlarm(result_.status,
@@ -373,6 +410,72 @@ public:
         if (pRecord_->pact) callbackRequestProcessCallback(&callback_, pRecord_->prio, pRecord_);
     }
 
+#ifdef ASYN_HAVE_SCAN_ONCE_CALLBACK
+    /* Completion callback for the scanOnceCallback() request made by
+     * requestOutputProcessing().  Called by the scanOnce thread after it has run
+     * dbProcess() on the record, whether or not the record actually processed,
+     * and with no locks held.  The queue entry is gone by now, so clear the flag.
+     *
+     * Only request the next processing if the record really did process:
+     * process() sets scanOnceProcessed_ for that.  If dbProcess() declined (the
+     * record was still active from an asynchronous write, or disabled),
+     * re-requesting here would simply be declined again and spin.  Leaving the
+     * flag clear is enough - the next interrupt callback requests again. */
+    static void onceComplete(void *usr, dbCommon *prec)
+    {
+        devAsynXXXArray *pPvt = (devAsynXXXArray *)usr;
+
+        epicsMutexLock(pPvt->ringBufferLock_);
+        pPvt->scanOnceRequested_ = false;
+        if (pPvt->scanOnceProcessed_ && (pPvt->ringTail_ != pPvt->ringHead_)) {
+            pPvt->requestOutputProcessing();
+        }
+        epicsMutexUnlock(pPvt->ringBufferLock_);
+    }
+
+    /* Request that an output record process to consume its readback ring buffer.
+     * Must be called with ringBufferLock_ held.
+     *
+     * As for requestRecordProcessing(), at most one request is outstanding per
+     * record, so the record occupies at most one entry of the scanOnce queue
+     * however many readback values are buffered.  onceComplete() clears the flag
+     * once the request has been serviced and requests the next one while values
+     * remain. */
+    void requestOutputProcessing()
+    {
+        if (scanOnceRequested_) return;
+        scanOnceProcessed_ = false;
+        if (scanOnceCallback((dbCommon *)pRecord_, onceComplete, this) == 0)
+            scanOnceRequested_ = true;
+    }
+#endif
+
+    /* Request that the record process so that it consumes the ring buffer.
+     * Must be called with ringBufferLock_ held.
+     *
+     * At most one request is outstanding per record at any time: while values
+     * remain in the ring buffer getRingBufferValue() issues the next request as
+     * it pops each value.  The EPICS general purpose callback queue therefore
+     * needs only one entry per record, rather than one entry per ring buffer
+     * element.
+     *
+     * From EPICS 3.15 on, scanIoRequest() returns a mask of the scan priorities
+     * it queued the request for; 0 means nothing was queued, e.g. because the
+     * record is not (yet) I/O Intr scanned, scanning has not been started, or
+     * the callback queue is full.  Leave scanIoRequested_ clear in that case, so
+     * the next callback retries rather than waiting forever for a request that
+     * was never queued. */
+    void requestRecordProcessing()
+    {
+        if (scanIoRequested_) return;
+#if LT_EPICSBASE(3,15,0,0)
+        scanIoRequest(ioScanPvt_);
+        scanIoRequested_ = true;
+#else
+        if (scanIoRequest(ioScanPvt_) != 0) scanIoRequested_ = true;
+#endif
+    }
+
     int getRingBufferValue()
     {
         int ret = 0;
@@ -390,6 +493,19 @@ public:
             ringTail_ = (ringTail_ == ringSize_-1) ? 0 : ringTail_ + 1;
             ret = 1;
         }
+        if (scanIoRequested_) {
+            /* We are processing because of a scanIoRequest() from
+             * interruptCallback(), and the callback queue entry for it has
+             * already been taken off the queue.  Request the next processing here
+             * if there are more values to drain, so that only one queue entry per
+             * record is ever needed.  Doing this while still holding
+             * ringBufferLock_ is what makes it safe: interruptCallback() either
+             * sees the flag still set and relies on us to re-request, or sees it
+             * cleared and requests itself, so a value can never be left in the
+             * ring buffer with no request outstanding. */
+            scanIoRequested_ = false;
+            if (ringTail_ != ringHead_) requestRecordProcessing();
+        }
         epicsMutexUnlock(ringBufferLock_);
         return ret;
     }
@@ -397,6 +513,9 @@ public:
     void interruptCallback(asynUser *pasynUser, EPICS_TYPE *value, size_t len)
     {
         int i;
+#ifndef ASYN_HAVE_SCAN_ONCE_CALLBACK
+        bool newElement = true;
+#endif
         EPICS_TYPE *pData = (EPICS_TYPE *)pRecord_->bptr;
         static const char *functionName = "interruptCallback";
 
@@ -447,13 +566,32 @@ public:
                  * is guaranteed to be the most recent value */
                 ringTail_ = (ringTail_ == ringSize_ - 1) ? 0 : ringTail_ + 1;
                 ringBufferOverflows_++;
-            } else {
+#ifndef ASYN_HAVE_SCAN_ONCE_CALLBACK
+                newElement = false;
+#endif
+            }
+            if (isOutput_) {
+#ifdef ASYN_HAVE_SCAN_ONCE_CALLBACK
+                /* Ask the record to process.  A no-op if a request is already
+                 * outstanding, so a burst of readback callbacks needs only a
+                 * single scanOnce queue entry; onceComplete() requests the next
+                 * one while values remain.  This must also be called when we just
+                 * replaced an element, so that a request which previously could
+                 * not be queued is retried. */
+                requestOutputProcessing();
+#else
                 /* We only need to request the record to process if we added a new
                  * element to the ring buffer, not if we just replaced an element. */
-                if (isOutput_)
-                    scanOnce((dbCommon *)pRecord_);
-                else
-                    scanIoRequest(ioScanPvt_);
+                if (newElement) scanOnce((dbCommon *)pRecord_);
+#endif
+            } else {
+                /* Ask the record to process; a no-op if a request is already
+                 * outstanding.  getRingBufferValue() requests the next processing
+                 * as it drains the ring buffer, so only one callback queue entry
+                 * per record is needed.  This must also be called when we just
+                 * replaced an element, so that a request which previously could
+                 * not be queued is retried. */
+                requestRecordProcessing();
             }
             epicsMutexUnlock(ringBufferLock_);
         }
