@@ -55,6 +55,13 @@ ifneq ($(EPICS_LIBCOM_ONLY),YES)
   DIRS += testQueueOverflowApp
   testQueueOverflowApp_DEPEND_DIRS = asyn
   iocBoot_DEPEND_DIRS += testQueueOverflowApp
+  # testParallelCallbackApp uses callbackQueueStatus() and epicsCallback,
+  # which are not available before EPICS Base 7
+  ifdef BASE_7_0
+    DIRS += testParallelCallbackApp
+    testParallelCallbackApp_DEPEND_DIRS = asyn
+    iocBoot_DEPEND_DIRS += testParallelCallbackApp
+  endif
   DIRS += testUsbtmcApp
   testUsbtmcApp_DEPEND_DIRS = asyn
   iocBoot_DEPEND_DIRS += testUsbtmcApp
