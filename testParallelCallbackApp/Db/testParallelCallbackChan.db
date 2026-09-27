@@ -1,0 +1,18 @@
+# One I/O Intr scanned longin record connected to one channel of a
+# testParallelCallback asyn port. Loaded once per channel by
+# testParallelCallbackLoadRecords(), which supplies P (the record name prefix)
+# and N (the channel number), so the records are named $(P)0 .. $(P)n-1.
+#
+# The record has no links of any kind, so every record is in a lock set of its
+# own and nothing stops the general purpose callback queue workers from
+# processing all of them at the same time.
+
+record(longin, "$(P)$(N)")
+{
+    field(DESC, "parallel callback test channel $(N)")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),0,1)CHANNEL$(N)")
+    field(SCAN, "I/O Intr")
+    field(PRIO, "$(PRIO=LOW)")
+    info(asyn:FIFO, "$(FIFO=10)")
+}

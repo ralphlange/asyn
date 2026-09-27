@@ -13,6 +13,12 @@
     on older versions the previous behaviour is kept.
     Update testArrayRingBufferApp to exercise and show this.
   - Add testQueueOverflowApp, which demonstrates and verifies the above bounds.
+  - Add testParallelCallbackApp, which measures how I/O Intr scanned records scale
+    when the EPICS general purpose callback queue is served by more than one worker
+    thread (callbackParallelThreads()), together with a control measurement that
+    uses plain callbackRequest()s instead of asyn. It shows that the slowdown
+    reported in issue #170 is the contention on the callback queue itself and is
+    not caused by asyn.
   - Thanks to Ralph Lange (with Claude Opus 5) for this.
 
 ## Release 4-46 (July 20, 2026)
